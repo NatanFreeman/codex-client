@@ -1,0 +1,8 @@
+[package]
+name = "codex-tunnel"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "codex-tunnel"
+path = "src/main.rs"
