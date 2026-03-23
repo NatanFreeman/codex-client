@@ -11,16 +11,18 @@ const TUNNEL_TIMEOUT_SECS: u64 = 15;
 fn main() {
     println!("=== Codex SSH Tunnel Helper ===\n");
 
-    let vps_host = get_vps_host();
+    let remote = get_remote();
+
     let forward_arg = format!(
         "{}:{}:{}:{}",
         TUNNEL_BIND, TUNNEL_PORT, TUNNEL_BIND, TUNNEL_PORT
     );
-    let remote = format!("root@{}", vps_host);
 
     println!(
         "[*] Spawning tunnel: localhost:{} -> {}:{}",
-        TUNNEL_PORT, vps_host, TUNNEL_PORT
+        TUNNEL_PORT,
+        remote,
+        TUNNEL_PORT
     );
 
     let mut ssh = Command::new("ssh")
@@ -44,23 +46,22 @@ fn main() {
     println!("[*] SSH PID: {}. Waiting for tunnel...", ssh.id());
 
     if wait_for_local_port(TUNNEL_BIND, TUNNEL_PORT, TUNNEL_TIMEOUT_SECS) {
-        println!(
-            "[+] Tunnel is live on {}:{}",
-            TUNNEL_BIND, TUNNEL_PORT
-        );
+        println!("[+] Tunnel is live on {}:{}", TUNNEL_BIND, TUNNEL_PORT);
     } else {
         eprintln!(
             "[!] Port {}:{} did not open within {}s.",
             TUNNEL_BIND, TUNNEL_PORT, TUNNEL_TIMEOUT_SECS
         );
-        eprintln!("    Check your SSH credentials and that the VPS is reachable.");
+        eprintln!(
+            "    Check your SSH credentials and that the Mac is reachable."
+        );
         ssh.kill().ok();
         std::process::exit(1);
     }
 
     println!();
     println!("-------------------------------------------------------------");
-    println!("  On your VPS, run:  codex login");
+    println!("  On your Mac, run:  codex login");
     println!("  Then paste the auth URL printed by Codex below.");
     println!("  (Kill any stale codex processes first: pkill -f codex)");
     println!("-------------------------------------------------------------");
@@ -81,7 +82,9 @@ fn main() {
     }
 
     println!();
-    println!("[*] Press Enter once authentication is complete to shut down the tunnel.");
+    println!(
+        "[*] Press Enter once authentication is complete to shut down the tunnel."
+    );
     read_line();
 
     println!("[*] Closing SSH tunnel (PID {})...", ssh.id());
@@ -94,14 +97,110 @@ fn main() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn get_vps_host() -> String {
+fn get_remote() -> String {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 {
-        return args[1].clone();
+    let raw = if args.len() > 1 {
+        args[1].clone()
+    } else {
+        print!("Enter remote in user@ip format (e.g. alice@192.168.1.50): ");
+        io::stdout().flush().unwrap();
+        read_line().trim().to_string()
+    };
+
+    validate_remote_or_die(&raw);
+    raw
+}
+
+fn validate_remote_or_die(input: &str) {
+    let parts: Vec<&str> = input.splitn(2, '@').collect();
+
+    let (user, ip_str) = match parts.as_slice() {
+        [u, ip] => (*u, *ip),
+        _ => die_bad_input(input, "Missing '@' separator. Expected format: user@ip"),
+    };
+
+    if user.is_empty() {
+        die_bad_input(input, "Username is empty. Expected format: user@ip");
     }
-    print!("Enter VPS host or IP (e.g. 203.0.113.42): ");
-    io::stdout().flush().unwrap();
-    read_line().trim().to_string()
+
+    if user.contains(' ') {
+        die_bad_input(input, "Username contains a space.");
+    }
+
+    validate_ipv4_or_die(input, ip_str);
+}
+
+fn validate_ipv4_or_die(raw_input: &str, ip_str: &str) {
+    let octets: Vec<&str> = ip_str.split('.').collect();
+
+    if octets.len() != 4 {
+        die_bad_input(
+            raw_input,
+            &format!(
+                "IP '{}' must have exactly 4 octets (got {}).",
+                ip_str,
+                octets.len()
+            ),
+        );
+    }
+
+    for (i, octet) in octets.iter().enumerate() {
+        if octet.is_empty() {
+            die_bad_input(
+                raw_input,
+                &format!("Octet {} is empty (double dot or trailing dot).", i + 1),
+            );
+        }
+
+        // Reject leading zeros (e.g. "01", "007") — ambiguous and wrong
+        if octet.len() > 1 && octet.starts_with('0') {
+            die_bad_input(
+                raw_input,
+                &format!(
+                    "Octet {} ('{}') has a leading zero. Write it as plain digits.",
+                    i + 1,
+                    octet
+                ),
+            );
+        }
+
+        match octet.parse::<u32>() {
+            Ok(n) if n <= 255 => {}
+            Ok(n) => die_bad_input(
+                raw_input,
+                &format!(
+                    "Octet {} ('{}') is {}. Each octet must be 0-255.",
+                    i + 1,
+                    octet,
+                    n
+                ),
+            ),
+            Err(_) => die_bad_input(
+                raw_input,
+                &format!(
+                    "Octet {} ('{}') is not a number.",
+                    i + 1,
+                    octet
+                ),
+            ),
+        }
+    }
+}
+
+fn die_bad_input(input: &str, reason: &str) -> ! {
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════════════╗");
+    eprintln!("║                  INVALID INPUT — ABORTING                ║");
+    eprintln!("╚══════════════════════════════════════════════════════════╝");
+    eprintln!();
+    eprintln!("  You entered : {:?}", input);
+    eprintln!("  Problem     : {}", reason);
+    eprintln!();
+    eprintln!("  Expected    : user@ip   e.g.  alice@192.168.1.50");
+    eprintln!("  IP rules    : exactly 4 numeric octets, each 0-255,");
+    eprintln!("                separated by dots, no leading zeros.");
+    eprintln!();
+    std::process::exit(1);
 }
 
 fn read_line() -> String {
@@ -113,7 +212,6 @@ fn read_line() -> String {
         .unwrap_or_default()
 }
 
-/// Poll localhost:port once per second until it accepts a TCP connection.
 fn wait_for_local_port(host: &str, port: u16, timeout_secs: u64) -> bool {
     let addr = format!("{}:{}", host, port);
     for i in 1..=timeout_secs {
@@ -121,16 +219,14 @@ fn wait_for_local_port(host: &str, port: u16, timeout_secs: u64) -> bool {
         if TcpStream::connect(&addr).is_ok() {
             return true;
         }
-        print!("\r[*] Still waiting... ({}/{}s)", i, timeout_secs);
+        print!("\r[*] Still waiting... ({}/{}s)  ", i, timeout_secs);
         io::stdout().flush().unwrap();
     }
     println!();
     false
 }
 
-/// Use `cmd /c start` to open a URL in the default Windows browser.
 fn open_in_browser(url: &str) {
-    // `start` requires an empty title arg when the target contains special chars.
     Command::new("cmd")
         .args(["/c", "start", "", url])
         .spawn()
